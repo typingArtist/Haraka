@@ -104,7 +104,7 @@ exports.load_tls_opts = {
     'TLS dhparams loaded' : function (test) {
         test.expect(1);
         this.plugin.load_tls_opts();
-        test.equal(this.plugin.tls_opts.dhparam.toString(), '-----BEGIN DH PARAMETERS-----\nMIGHAoGBAMylA+U3JgfrXqnNYJXQN70nRWjzA4sndjkjW+hLhHgQ/K8Ndwj7lfQz\ng95rLJOuvjEAkYqSANhaVNnKge6FqMM0FdW0/gFSfAh7PZJsOt9ypQRvyyX8/P3T\nzW4WTRaHNBOala5yT7pxXrzpIbkaUXAkrk2E9TjqD4pjgk9VYtFrAgEC\n-----END DH PARAMETERS-----\n');
+        test.equal(this.plugin.tls_opts.dhparam.toString(), '-----BEGIN DH PARAMETERS-----\nMIIBCAKCAQEAuwDoFYlDlkC/Ps8vXcr68P+4LXF34DREyyhlAXUmXIFSCjTU+U6t\nIuettYQMOGL7n9FyV8rRpycK0MIJ9bNE0y2EAlmLAx2NFCNo4his919O8lQp7Q0C\ntg/TIDoQSCf+9MS7+eHNpLaZj34FYh/BWspaQ5Jeove5NUEqlGuDewgLAiD9L2Fl\ni9pWJTTcxpTofsvkA70eHQpu0+BE2DwrCYrMMhoAkwq0kV0yk5xmcjMN3E6ecZBM\nBAW24iHO7XGYl8+ccALS+iYbRwihPqlsLfguOYv+FOYsGNIZNNuQ72MXUdRgwmlS\nQlaG93FVBpTgO/wRyXmmnut/kJn4G/x9mwIBAg==\n-----END DH PARAMETERS-----\n');
         test.done();
     },
 };
