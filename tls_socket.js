@@ -5,20 +5,10 @@
 
 var tls       = require('tls');
 var constants = require('constants');
-var crypto    = require('crypto');
 var util      = require('util');
 var net       = require('net');
 var stream    = require('stream');
 var log       = require('./logger');
-var EventEmitter = require('events');
-
-var ocsp;
-try {
-    ocsp      = require('ocsp');
-} catch (er) {
-    log.lognotice("Can't load module ocsp. OCSP Stapling not available.");
-    ocsp = null;
-}
 
 // provides a common socket for attaching
 // and detaching from either main socket, or crypto socket
@@ -162,109 +152,16 @@ function pipe(cleartext, socket) {
     socket.on('close', onclose);
 }
 
-if (ocsp) {
-    function pseudoTLSServer() {
-        EventEmitter.call(this);
-    }
-    util.inherits(pseudoTLSServer, EventEmitter);
-
-    var ocspCache = new ocsp.Cache();
-    var pseudoServ = new pseudoTLSServer();
-
-    pseudoServ.on('OCSPRequest', function(cert, issuer, cb2) {
-        ocsp.getOCSPURI(cert, function(err, uri) {
-            log.logdebug('OCSP Request, URI: ' + uri + ', err=' +err);
-            if (err) {
-                return cb(err);
-            }
-
-            var req = ocsp.request.generate(cert, issuer);
-            var options = {
-                url: uri,
-                ocsp: req.data
-            };
-
-            // look for a cached value first
-            ocspCache.probe(req.id, function(_x, result) {
-                log.logdebug('OCSP cache result: ' + util.inspect(result));
-                if (result) {
-                    cb2(_x, result.response);
-                } else {
-                    log.logdebug('OCSP req:' + util.inspect(req));
-                    ocspCache.request(req.id, options, cb2);
-                }
-            });
-        });
-    });
-
-    exports.shutdown = function() {
-        log.logdebug('Cleaning ocspCache. How many keys? ' + Object.keys(ocspCache.cache).length);
-        Object.keys(ocspCache.cache).forEach(function (key) {
-            var e = ocspCache.cache[key];
-            clearTimeout(e.timer);
-        });
-    };
-}
-
-exports.ocsp = ocsp;
-
 function createServer(cb) {
     var serv = net.createServer(function (cryptoSocket) {
 
         var socket = new pluggableStream(cryptoSocket);
 
         socket.upgrade = function (options, cb2) {
-            log.logdebug('Upgrading to TLS');
+            log.logdebug('Upgrading to TLS with options=' + util.inspect(options));
 
             socket.clean();
             cryptoSocket.removeAllListeners('data');
-
-            // Set SSL_OP_ALL for maximum compatibility with broken clients
-            // See http://www.openssl.org/docs/ssl/SSL_CTX_set_options.html
-            if (!options) options = {};
-            // TODO: bug in Node means we can't do this until it's fixed
-            // options.secureOptions = constants.SSL_OP_ALL;
-
-            // Setting secureProtocol to 'SSLv23_method' and secureOptions to
-            // constants.SSL_OP_NO_SSLv2/3 are used to disable SSLv2 and SSLv3
-            // protocol support, to prevent DROWN and POODLE attacks at least.
-            // Node's docs here are super unhelpful, e.g.
-            // <https://nodejs.org/api/tls.html#tls_tls_createserver_options_secureconnectionlistener>
-            // doesn't even mention secureOptions.  Some digging reveals the
-            // relevant openssl docs: secureProtocol is documented in
-            // <https://www.openssl.org/docs/manmaster/ssl/ssl.html#DEALING-WITH-PROTOCOL-METHODS>,
-            // (note: you'll want to select the correct openssl version that
-            // node was compiled against, instead of master), and secureOptions
-            // are documented in
-            // <https://www.openssl.org/docs/manmaster/ssl/SSL_CTX_set_options.html>
-            // (again, select the appropriate openssl version, not master).
-            // One caveat: it doesn't seem like all options are actually
-            // compiled into node.  To see which ones are, fire up node and
-            // examine the object returned by require('constants').
-
-            // use cached secureContext as the relevant options are static
-            if (!options.secureContext) {
-                options.secureProtocol = options.secureProtocol || 'SSLv23_method';
-                options.secureOptions = options.secureOptions |
-                       constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3;
-
-                if (options.requestCert === undefined) {
-                    options.requestCert = true;
-                }
-                if (options.rejectUnauthorized === undefined) {
-                    options.rejectUnauthorized = false;
-                }
-                options.secureContext = (tls.createSecureContext || crypto.createCredentials)(options);
-                options.isServer = true;
-                if (options.enableOCSPStapling) {
-                    if (ocsp) {
-                        options.server = pseudoServ;
-                        pseudoServ._sharedCreds = options.secureContext;
-                    } else {
-                        log.logerr("OCSP Stapling cannot be enabled because the ocsp module is not loaded");
-                    }
-                }
-            }
 
             var cleartext = new tls.TLSSocket(cryptoSocket, options);
 
@@ -343,7 +240,7 @@ function connect (port, host, cb) {
                 options.rejectUnauthorized = false;
             }
         }
-        options.sslcontext = (tls.createSecureContext || crypto.createCredentials)(options);
+        options.sslcontext = tls.createSecureContext(options);
         options.socket = cryptoSocket;
 
         var cleartext = new tls.connect(options);

@@ -1,30 +1,51 @@
 // TLS is built into Haraka. Enabling this plugin advertises STARTTLS.
 // see 'haraka -h tls' for help
 
+var constants = require('constants');
+var events    = require('events');
+var log       = require('./logger');
+var tls       = require('tls');
+var util      = require('util');
+
 var net_utils = require('haraka-net-utils');
+
 var tls_socket = require('./tls_socket');
+
+// dynamic loading OCSP
+var ocsp;
+try {
+    ocsp      = require('ocsp');
+} catch (er) {
+    log.lognotice("Can't load module ocsp. OCSP Stapling not available.");
+    ocsp = null;
+}
 
 exports.register = function () {
     var plugin = this;
     plugin.load_errs = [];
+    plugin.section_errors = 0;
+
+    plugin.createOcspCache();
 
     // declare first, these opts might be updated by tls.ini
     plugin.tls_opts = {
         key: 'tls_key.pem',
         cert: 'tls_cert.pem',
+        secureProtocol: 'SSLv23_method',
     };
 
     plugin.load_tls_ini();
     plugin.load_tls_opts();
+    plugin.load_tls_ctx();
 
     // make sure TLS setup was valid before registering hooks
     if (plugin.load_errs.length > 0) return;
     if (!plugin.tls_opts.cert.length) {
-        plugin.logerror("no certificates loaded");
+        log.logerror("no certificates loaded");
         return;
     }
     if (!plugin.tls_opts.key.length) {
-        plugin.logerror("no keys loaded");
+        log.logerror("no keys loaded");
         return;
     }
 
@@ -34,13 +55,10 @@ exports.register = function () {
     plugin.register_hook('unrecognized_command', 'upgrade_connection');
 };
 
-exports.shutdown = function() {
-    if (tls_socket.shutdown) tls_socket.shutdown();
-};
-
 exports.load_err = function (errMsg) {
     this.logcrit(errMsg + " See 'haraka -h tls'");
     this.load_errs.push(errMsg);
+    this.section_errors += 1;
 };
 
 exports.load_pem = function (file) {
@@ -48,75 +66,213 @@ exports.load_pem = function (file) {
     return plugin.config.get(file, 'binary');
 };
 
+exports.createOcspCache = function() {
+    var plugin=this;
+    if (ocsp) plugin.ocspCache = new ocsp.Cache();
+};
+
+function PseudoServer(plugin, options) {
+    events.EventEmitter.call(this);
+    var server=this;
+
+    // that's how we can quickly initialize our pseudo server to acting
+    // as an OCSP server
+    this.plugin = plugin;
+    this.options = options;
+    this._sharedCreds = options.secureContext;
+
+    if (options.enableOCSPStapling) {
+        if (ocsp) {
+            this.on('OCSPRequest', function(cert, issuer, cb2) {
+                ocsp.getOCSPURI(cert, function(err, uri) {
+                    log.logdebug('OCSP Request, URI: ' + uri + ', err=' +err);
+                    if (err) {
+                        return cb(err);
+                    }
+
+                    var req = ocsp.request.generate(cert, issuer);
+                    var options = {
+                        url: uri,
+                        ocsp: req.data
+                    };
+
+                    // look for a cached value first
+                    plugin.ocspCache.probe(req.id, function(_x, result) {
+                        log.logdebug('OCSP cache result: ' + util.inspect(result));
+                        if (result) {
+                            cb2(_x, result.response);
+                        } else {
+                            log.logdebug('OCSP req:' + util.inspect(req));
+                            plugin.ocspCache.request(req.id, options, cb2);
+                        }
+                    });
+                });
+            });
+        } else {
+            log.logerror("OCSP Stapling cannot be enabled because the ocsp module is not loaded");
+        }
+    }
+
+}
+util.inherits(PseudoServer, events.EventEmitter);
+
+exports.shutdown = function() {
+    var plugin=this;
+    if (ocsp) {
+        log.logdebug('Cleaning ocspCache with ' + Object.keys(plugin.ocspCache.cache).length) + " keys.";
+        Object.keys(plugin.ocspCache.cache).forEach(function (key) {
+            var e = plugin.ocspCache.cache[key];
+            clearTimeout(e.timer);
+        });
+    }
+};
+
+exports.ocsp = ocsp;
+
 exports.load_tls_ini = function () {
     var plugin = this;
+
+    var sni_defaults = Object.assign({},plugin.tls_opts);
 
     plugin.cfg = net_utils.load_tls_ini(function () {
         plugin.load_tls_ini();
     });
 
-    var config_options = ['ciphers','requestCert','rejectUnauthorized',
+    var common_options = ['ciphers','requestCert','rejectUnauthorized',
         'key','cert','honorCipherOrder','ecdhCurve','dhparam',
         'secureProtocol','enableOCSPStapling'];
 
-    for (var i = 0; i < config_options.length; i++) {
-        var opt = config_options[i];
-        if (plugin.cfg.main[opt] === undefined) { continue; }
-        plugin.tls_opts[opt] = plugin.cfg.main[opt];
+    var sni_options = common_options;
+
+    var config_options = common_options.slice();
+    config_options.push('enableSNI');
+
+    // enter defaults according to the list of options, given in the prefs array
+    var set_opts = function(tls_opts, opts, prefs) {
+        opts.forEach((opt) => {
+            prefs.forEach((pref) => {
+                if (pref[opt] !== undefined)
+                    tls_opts[opt] = pref[opt];
+            });
+        });
     }
 
-    if (plugin.cfg.inbound) {
-        for (var i = 0; i < config_options.length; i++) {
-            var opt = config_options[i];
-            if (plugin.cfg.inbound[opt] === undefined) { continue; }
-            plugin.tls_opts[opt] = plugin.cfg.inbound[opt];
-        }
+    // defaults for non-SNI default host name
+    set_opts(plugin.tls_opts, config_options,
+             [plugin.cfg.main, plugin.cfg.inbound || {}]);
+
+    if (plugin.tls_opts.enableSNI) {
+        plugin.tls_opts.sni = {}
+        Object.keys(plugin.cfg).forEach((k) => {
+            var match_array = k.match(/^inbound:SNI:(.*)$/);
+            if (match_array) {
+                var sni_name = match_array[1].toLowerCase();
+                plugin.tls_opts.sni[sni_name] = Object.assign({}, sni_defaults);
+                set_opts(plugin.tls_opts.sni[sni_name], sni_options,
+                         [plugin.cfg.main, plugin.cfg[k]]);
+            }
+        });
     }
+
+    log.logdebug(plugin.tls_opts);
+
 };
 
 exports.load_tls_opts = function () {
     var plugin = this;
 
-    plugin.logdebug(plugin.tls_opts);
-
-    if (plugin.tls_opts.dhparam) {
-        plugin.tls_opts.dhparam = plugin.load_pem(plugin.tls_opts.dhparam);
-        if (!plugin.tls_opts.dhparam) {
-            plugin.load_err("dhparam not loaded.");
+    var load_tls_files = function(tls_opts, scope) {
+        plugin.section_errors = 0;
+        if (tls_opts.dhparam) {
+            var dhparam_filename = tls_opts.dhparam;
+            tls_opts.dhparam = plugin.load_pem(tls_opts.dhparam);
+            if (!tls_opts.dhparam) {
+                plugin.load_err("dhparam not loaded from " + dhparam_filename + " for " + scope + ".");
+            }
         }
-    }
 
-    // make non-array key/cert option into Arrays with one entry
-    if (!(Array.isArray(plugin.tls_opts.key))) {
-        plugin.tls_opts.key = [plugin.tls_opts.key];
-    }
-    if (!(Array.isArray(plugin.tls_opts.cert))) {
-        plugin.tls_opts.cert = [plugin.tls_opts.cert];
-    }
-
-    if (plugin.tls_opts.key.length != plugin.tls_opts.cert.length) {
-        plugin.load_err("number of keys (" +
-                       plugin.tls_opts.key.length + ") doesn't match number of certs (" +
-                       plugin.tls_opts.cert.length + ").");
-    }
-
-    // turn key/cert file names into actual key/cert binary data
-    plugin.tls_opts.key = plugin.tls_opts.key.map(function(keyFileName) {
-        var key = plugin.load_pem(keyFileName);
-        if (!key) {
-            plugin.load_err("tls key " + keyFileName + " could not be loaded.");
+        // make non-array key/cert option into Arrays with one entry
+        if (!(Array.isArray(tls_opts.key))) {
+            tls_opts.key = [tls_opts.key];
         }
-        return key;
-    });
-    plugin.tls_opts.cert = plugin.tls_opts.cert.map(function(certFileName) {
-        var cert = plugin.load_pem(certFileName);
-        if (!cert) {
-            plugin.load_err("tls cert " + certFileName + " could not be loaded.");
+        if (!(Array.isArray(tls_opts.cert))) {
+            tls_opts.cert = [tls_opts.cert];
         }
-        return cert;
-    });
 
-    plugin.logdebug(plugin.tls_opts);
+        if (tls_opts.key.length != tls_opts.cert.length) {
+            plugin.load_err("number of keys (" +
+                           tls_opts.key.length + ") doesn't match number of certs (" +
+                           tls_opts.cert.length + ") for " + scope + ".");
+        }
+
+        // turn key/cert file names into actual key/cert binary data
+        tls_opts.key = tls_opts.key.map(function(keyFileName) {
+            var key = plugin.load_pem(keyFileName);
+            if (!key) {
+                plugin.load_err("tls key " + keyFileName + " could not be loaded for " + scope + ".");
+            }
+            return key;
+        });
+        tls_opts.cert = tls_opts.cert.map(function(certFileName) {
+            var cert = plugin.load_pem(certFileName);
+            if (!cert) {
+                plugin.load_err("tls cert " + certFileName + " could not be loaded for " + scope + ".");
+            }
+            return cert;
+        });
+
+        tls_opts.confValid = plugin.section_errors == 0;
+    }
+
+    load_tls_files(plugin.tls_opts, "main/inbound");
+
+    if (plugin.tls_opts.enableSNI) {
+        Object.keys(plugin.tls_opts.sni).forEach((domain) => {
+            load_tls_files(plugin.tls_opts.sni[domain], domain);
+        });
+    }
+
+    log.logdebug(plugin.tls_opts);
+};
+
+exports.load_tls_ctx = function() {
+    var plugin = this;
+
+    var create_secure_context = function(domain, options) {
+        log.logdebug("creating secure context for " + domain + ": " + util.inspect(options));
+        options.secureOptions = options.secureOptions |
+               constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3;
+
+        options.secureContext = tls.createSecureContext(options);
+        options.isServer = true;
+        options.server = new PseudoServer(plugin, options);
+    }
+
+    if (plugin.tls_opts.confValid)
+        create_secure_context("main/inbound", plugin.tls_opts);
+
+    if (plugin.tls_opts.enableSNI) {
+        plugin.tls_opts.SNICallback = function(servername, cb) {
+            var ctx;
+            if (plugin.tls_opts.sni[servername] && plugin.tls_opts.sni[servername].secureContext) {
+                // return SNI secure context
+                log.logdebug("SNI: loading secure context for " + servername);
+                ctx = plugin.tls_opts.sni[servername].secureContext;
+            } else {
+                // not found: return default secure context
+                log.logdebug("SNI: No special secure context found for " + servername + ", using default context");
+                ctx = plugin.tls_opts.secureContext;
+            }
+            cb(null, ctx);
+        }
+
+        Object.keys(plugin.tls_opts.sni).forEach((domain) => {
+            if (plugin.tls_opts.sni[domain].confValid)
+                create_secure_context(domain, plugin.tls_opts.sni[domain]);
+        });
+    }
+
+    log.logdebug(plugin.tls_opts);
 };
 
 exports.advertise_starttls = function (next, connection) {
